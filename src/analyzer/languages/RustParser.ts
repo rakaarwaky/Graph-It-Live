@@ -6,6 +6,7 @@ import { FileReader } from "../FileReader";
 import { Dependency, ILanguageAnalyzer, SpiderError } from "../types";
 import { extractFilePath } from "../utils/PathExtractor";
 import { WasmParserFactory } from "./WasmParserFactory";
+import { WorkspaceResolver } from "./WorkspaceResolver";
 
 /**
  * Rust import parser backed by tree-sitter WASM.
@@ -18,11 +19,14 @@ export class RustParser implements ILanguageAnalyzer {
   private readonly rootDir: string;
   private readonly extensionPath?: string;
   private initPromise: Promise<void> | null = null;
+  private workspaceResolver: WorkspaceResolver | null = null;
 
   constructor(rootDir?: string, extensionPath?: string) {
     this.fileReader = new FileReader();
     this.rootDir = rootDir || process.cwd();
     this.extensionPath = extensionPath;
+    // Initialize workspace resolver for cross-crate imports
+    this.workspaceResolver = new WorkspaceResolver(this.rootDir);
   }
 
   /** Lazily initializes the WASM parser and reuses a single init promise. */
@@ -146,26 +150,15 @@ export class RustParser implements ILanguageAnalyzer {
       // Ensure WASM parser is initialized
       await this.ensureInitialized();
 
-      // Extract first component - if it's an external crate, return null
-      const firstComponent = moduleSpecifier.split("::")[0];
-      const externalCrates = new Set([
-        "std", "core", "alloc", "proc_macro", "test",
-        "serde", "tokio", "async_std", "futures",
-        "vm", "rustpython_vm", "rustpython",
-        "rustpython_parser", "rustpython_compiler",
-        "num_traits", "enum_dispatch", "dashmap",
-      ]);
-
-      // External crates don't map to local files
-      if (externalCrates.has(firstComponent)) {
-        return null;
+      // Initialize workspace resolver lazily
+      if (this.workspaceResolver && !this.workspaceResolver['initialized']) {
+        await this.workspaceResolver.init();
       }
 
-      // Extract file path from potential symbol ID
       const actualFromFile = extractFilePath(fromFile);
       const fromDir = path.dirname(actualFromFile);
 
-      // Handle relative modules (self, super, crate)
+      // 1. Handle relative modules (self, super, crate) — always try first
       if (
         moduleSpecifier.startsWith("self::") ||
         moduleSpecifier.startsWith("super::") ||
@@ -174,8 +167,50 @@ export class RustParser implements ILanguageAnalyzer {
         return await this.resolveRelativeModule(fromFile, moduleSpecifier);
       }
 
-      // Handle mod declarations (module_name)
-      return await this.resolveModDeclaration(fromDir, moduleSpecifier);
+      // 2. Try local module resolution FIRST (from current crate's directory)
+      // This handles: mod filesystem; in shared/src/lib.rs → shared/src/filesystem/
+      const localResult = await this.resolveModDeclaration(fromDir, moduleSpecifier);
+      if (localResult) return localResult;
+
+      // 3. Check hardcoded external crates (quick skip)
+      const firstComponent = moduleSpecifier.split("::")[0];
+      const externalCrates = new Set([
+        "std", "core", "alloc", "proc_macro", "test",
+        "serde", "tokio", "async_std", "futures",
+        "vm", "rustpython_vm", "rustpython",
+        "rustpython_parser", "rustpython_compiler",
+        "num_traits", "enum_dispatch", "dashmap",
+      ]);
+      if (externalCrates.has(firstComponent)) {
+        return null;
+      }
+
+      // 4. Check workspace crates (only if not found locally)
+      // This handles: use shared::filesystem::... from naming-rules crate
+      if (this.workspaceResolver?.isLocalCrate(firstComponent)) {
+        const crateSrcPath = this.workspaceResolver.resolveCrate(firstComponent);
+        if (crateSrcPath) {
+          const remainingPath = moduleSpecifier
+            .split("::")
+            .slice(1)
+            .join("/");
+          
+          // Try resolving the remaining path
+          const resolved = await this.resolveModDeclaration(crateSrcPath, remainingPath);
+          if (resolved) return resolved;
+          
+          // Fallback: if remaining path is a type (uppercase), return crate's lib.rs
+          const lastSegment = remainingPath.split("/").pop() ?? "";
+          if (lastSegment && lastSegment[0] === lastSegment[0].toUpperCase()) {
+            const libRs = path.join(crateSrcPath, "lib.rs");
+            if (await this.fileExists(libRs)) {
+              return normalizePath(libRs);
+            }
+          }
+        }
+      }
+
+      return null;
     } catch {
       // Resolution failures are not critical - return null
       return null;
@@ -194,28 +229,26 @@ export class RustParser implements ILanguageAnalyzer {
     // Find scoped_identifier or identifier nodes
     const identifiers = this.collectIdentifiers(node, content);
 
+    // Hardcoded external crates (quick skip for common ones)
+    const externalCrates = new Set([
+      "std", "core", "alloc", "proc_macro", "test",
+      "serde", "tokio", "async_std", "futures",
+      "vm", "rustpython_vm", "rustpython",
+      "rustpython_parser", "rustpython_compiler",
+      "num_traits", "enum_dispatch", "dashmap",
+    ]);
+
     for (const module of identifiers) {
       if (!module) continue;
       
-      // IMPORTANT: Detect external crates vs local modules
-      // External crates are NEVER treated as file dependencies
-      // Only the first component matters (e.g., "vm::Settings" → "vm" is external)
       const firstComponent = module.split("::")[0];
       
-      // List of known external crates to skip (common Rust/Python crates)
-      const externalCrates = new Set([
-        "std", "core", "alloc", "proc_macro", "test",
-        "serde", "tokio", "async_std", "futures",
-        "vm", "rustpython_vm", "rustpython",
-        "rustpython_parser", "rustpython_compiler",
-        "num_traits", "enum_dispatch", "dashmap",
-      ]);
-      
-      // Skip external crates - they don't map to local files
+      // Skip hardcoded external crates
       if (externalCrates.has(firstComponent)) {
         continue;
       }
       
+      // Include everything else — workspace resolver handles resolution, not filtering
       // For local modules, normalize to lowercase (Rust convention: file names are lowercase)
       const normalizedModule = module.toLowerCase();
       
@@ -281,7 +314,7 @@ export class RustParser implements ILanguageAnalyzer {
       const module = this.getNodeText(nameNode, content);
       if (!module) return;
 
-      // List of known external crates to skip
+      // Skip hardcoded external crates
       const externalCrates = new Set([
         "std", "core", "alloc", "proc_macro", "test",
         "serde", "tokio", "async_std", "futures",
@@ -289,13 +322,11 @@ export class RustParser implements ILanguageAnalyzer {
         "rustpython_parser", "rustpython_compiler",
         "num_traits", "enum_dispatch", "dashmap",
       ]);
-
-      // Skip external crates - they don't map to local files
       if (externalCrates.has(module)) {
         return;
       }
 
-      // For any remaining module declarations, normalize to lowercase
+      // Include everything else — workspace resolver handles resolution, not filtering
       const normalizedModule = module.toLowerCase();
       if (!seen.has(normalizedModule)) {
         seen.add(normalizedModule);
@@ -318,18 +349,37 @@ export class RustParser implements ILanguageAnalyzer {
     content: string,
   ): string[] {
     const identifiers: string[] = [];
+    const seen = new Set<string>();
 
     // Find scoped_identifier (e.g., std::collections::HashMap or crate::interpreter::func)
+    // Only collect OUTERMOST scoped_identifiers (skip nested prefixes)
     const scopedIds = this.findAllByType(node, "scoped_identifier");
     for (const scopedId of scopedIds) {
       const text = this.getNodeText(scopedId, content);
-      if (text) {
+      if (!text) continue;
+
+      // Check if this scoped_identifier is a child of another scoped_identifier
+      // If so, skip it — we only want the full path
+      let isNested = false;
+      let parent = scopedId.parent;
+      while (parent) {
+        if (parent.type === "scoped_identifier") {
+          isNested = true;
+          break;
+        }
+        parent = parent.parent;
+      }
+      if (isNested) continue;
+
+      // Deduplicate
+      if (!seen.has(text)) {
+        seen.add(text);
         identifiers.push(text);
       }
     }
 
     // Also collect simple identifiers, but ONLY if they're snake_case (module names)
-    // Reject PascalCase names which are types/structs/functions, not modules
+    // CRITICAL: Skip identifiers that are children of scoped_identifier nodes
     const simpleIds = this.findAllByType(node, "identifier");
     for (const id of simpleIds) {
       const text = this.getNodeText(id, content);
@@ -337,13 +387,27 @@ export class RustParser implements ILanguageAnalyzer {
         continue;
       }
 
-      // CRITICAL: Reject PascalCase identifiers - they are types/symbols, not modules
-      // Rust modules are always snake_case (lowercase with underscores)
+      // Reject PascalCase identifiers (types/symbols, not modules)
       const firstChar = text.charAt(0);
       if (firstChar === firstChar.toUpperCase() && firstChar !== firstChar.toLowerCase()) {
-        // Starts with uppercase = type/struct/trait/function, not a module
         continue;
       }
+
+      // Skip if already seen as part of a scoped_identifier
+      if (seen.has(text)) continue;
+
+      // Skip if this identifier is a child of a scoped_identifier
+      // (e.g., "shared" inside "shared::common::taxonomy_path_vo")
+      let parent = id.parent;
+      let isInsideScoped = false;
+      while (parent) {
+        if (parent.type === "scoped_identifier") {
+          isInsideScoped = true;
+          break;
+        }
+        parent = parent.parent;
+      }
+      if (isInsideScoped) continue;
 
       identifiers.push(text);
     }
@@ -379,6 +443,23 @@ export class RustParser implements ILanguageAnalyzer {
       return await this.resolveModDeclaration(fromDir, relativePath);
     }
 
+    // Handle cross-crate imports via workspace resolver
+    // e.g., in naming-rules: use shared::filesystem::...
+    // The first component might be a workspace member crate
+    if (this.workspaceResolver) {
+      const firstComponent = moduleSpecifier.split("::")[0];
+      if (this.workspaceResolver.isLocalCrate(firstComponent)) {
+        const crateSrcPath = this.workspaceResolver.resolveCrate(firstComponent);
+        if (crateSrcPath) {
+          const remainingPath = moduleSpecifier
+            .split("::")
+            .slice(1)
+            .join("/");
+          return await this.resolveModDeclaration(crateSrcPath, remainingPath);
+        }
+      }
+    }
+
     return null;
   }
 
@@ -391,20 +472,118 @@ export class RustParser implements ILanguageAnalyzer {
     fromDir: string,
     moduleName: string,
   ): Promise<string | null> {
-    // Rust convention: module file names are ALWAYS lowercase (snake_case)
-    // If requested module has uppercase letters, it's likely a symbol/type name, not a file
-    // This prevents false matches like "Settings" (external crate) → "settings.rs" (local file)
-    if (moduleName !== moduleName.toLowerCase()) {
-      // Contains uppercase - likely an external symbol/type, not a local file
+    // Reject empty or invalid module names
+    if (!moduleName || moduleName.trim().length === 0) {
+      return null;
+    }
+
+    // Reject clearly invalid paths (starts with /, contains .., etc.)
+    if (moduleName.startsWith("/") || moduleName.includes("..")) {
       return null;
     }
 
     // Convert :: to / for path resolution
     let modulePath = moduleName.replaceAll("::", "/");
-    // Normalize to lowercase: Rust file names follow snake_case convention
     modulePath = modulePath.toLowerCase();
 
-    // Try different file patterns
+    // Reject empty path after normalization
+    if (!modulePath || modulePath === "/") {
+      return null;
+    }
+
+    const segments = modulePath.split("/").filter(Boolean);
+    if (segments.length === 0) return null;
+
+    // Strategy 0: Progressive resolution (handle type imports)
+    const progressiveResult = await this.resolveProgressive(fromDir, segments);
+    if (progressiveResult) {
+      // If result is a mod.rs/lib.rs AND last segment is a type (uppercase),
+      // check re-exports to find the actual definition file
+      // IMPORTANT: Check ORIGINAL moduleName, not lowercased segments
+      const lastSegOriginal = moduleName.split("::").pop()?.split("/").pop() ?? "";
+      const isTypeImport = lastSegOriginal.length > 0 && lastSegOriginal[0] === lastSegOriginal[0].toUpperCase();
+      
+      if (isTypeImport && (progressiveResult.endsWith("/mod.rs") || progressiveResult.endsWith("/lib.rs"))) {
+        // Try re-export resolution to find the actual file
+        const reexportResult = await this.resolveReexport(path.dirname(progressiveResult), [lastSegOriginal.toLowerCase()]);
+        if (reexportResult) return reexportResult;
+      }
+      return progressiveResult;
+    }
+
+    // Strategy 0b: If last segment is not a file, try parent path
+    if (segments.length > 1) {
+      const parentSegments = segments.slice(0, -1);
+      const parentResult = await this.resolveModChain(fromDir, parentSegments);
+      if (parentResult) return parentResult;
+    }
+
+    // Strategy 1: Direct file/directory lookup
+    const directResult = await this.resolveDirectPath(fromDir, modulePath);
+    if (directResult) return directResult;
+
+    // Strategy 2: Recursive mod chain resolution
+    const recursiveResult = await this.resolveModChain(fromDir, segments);
+    if (recursiveResult) return recursiveResult;
+
+    // Strategy 3: Re-export resolution (pub use)
+    const reexportResult = await this.resolveReexport(fromDir, segments);
+    if (reexportResult) return reexportResult;
+
+    // Strategy 4: Workspace crate resolution
+    if (this.workspaceResolver) {
+      const firstSegment = segments[0];
+      if (this.workspaceResolver.isLocalCrate(firstSegment)) {
+        const crateSrcPath = this.workspaceResolver.resolveCrate(firstSegment);
+        if (crateSrcPath) {
+          const remainingPath = segments.slice(1).join("/");
+          if (remainingPath) {
+            return await this.resolveModDeclaration(crateSrcPath, remainingPath);
+          }
+          const libRs = path.join(crateSrcPath, "lib.rs");
+          if (await this.fileExists(libRs)) {
+            return normalizePath(libRs);
+          }
+        }
+      }
+    }
+
+    return null;
+  }
+
+  /**
+   * Strategy 0: Progressive resolution.
+   * Try the full path, then progressively shorter prefixes.
+   * This handles type imports like `use shared::common::taxonomy_path_vo::FilePath`
+   * where FilePath is a TYPE, not a module.
+   *
+   * Returns the deepest MODULE file that resolves (not a type file).
+   */
+  private async resolveProgressive(
+    fromDir: string,
+    segments: string[],
+  ): Promise<string | null> {
+    // Try from full path down to single segment
+    for (let len = segments.length; len >= 1; len--) {
+      const partialPath = segments.slice(0, len).join("/");
+      const result = await this.resolveDirectPath(fromDir, partialPath);
+      if (result) return result;
+
+      // Also try mod chain for this prefix
+      const chainResult = await this.resolveModChain(fromDir, segments.slice(0, len));
+      if (chainResult) return chainResult;
+    }
+    return null;
+  }
+
+  /**
+   * Strategy 1: Direct file/directory lookup.
+   * Try module.rs, module/mod.rs for the full path.
+   */
+  private async resolveDirectPath(
+    fromDir: string,
+    modulePath: string,
+  ): Promise<string | null> {
     const candidates = [
       path.join(fromDir, modulePath + ".rs"),
       path.join(fromDir, modulePath, "mod.rs"),
@@ -415,8 +594,161 @@ export class RustParser implements ILanguageAnalyzer {
         return normalizePath(candidate);
       }
     }
+    return null;
+  }
+
+  /**
+   * Strategy 2: Recursive mod chain resolution.
+   * Follow mod declarations one segment at a time:
+   *   lib.rs → mod common; → common/mod.rs → mod taxonomy_path_vo; → taxonomy_path_vo.rs
+   */
+  private async resolveModChain(
+    fromDir: string,
+    segments: string[],
+  ): Promise<string | null> {
+    let currentDir = fromDir;
+
+    for (let i = 0; i < segments.length; i++) {
+      const segment = segments[i];
+      const isLast = i === segments.length - 1;
+
+      // Try module.rs (leaf file)
+      const fileCandidate = path.join(currentDir, segment + ".rs");
+      if (await this.fileExists(fileCandidate)) {
+        if (isLast) {
+          return normalizePath(fileCandidate);
+        }
+        // Not last segment — can't go deeper from a .rs file
+        // (unless it's a mod.rs, which we try next)
+      }
+
+      // Try module/mod.rs (directory module)
+      const modDir = path.join(currentDir, segment);
+      const modRs = path.join(modDir, "mod.rs");
+      if (await this.fileExists(modRs)) {
+        if (isLast) {
+          return normalizePath(modRs);
+        }
+        // Continue to next segment from this directory
+        currentDir = modDir;
+        continue;
+      }
+
+      // Try module.rs as a file that declares sub-modules
+      // (e.g., common.rs that has `mod taxonomy_path_vo;` inside)
+      if (await this.fileExists(fileCandidate)) {
+        // The file exists but we need to find a sub-module inside it
+        // This is unusual — normally sub-modules are in mod.rs
+        // Skip for now
+      }
+
+      // Can't resolve this segment
+      return null;
+    }
 
     return null;
+  }
+
+  /**
+   * Strategy 3: Re-export resolution (pub use).
+   * Check barrel files (lib.rs, mod.rs) for pub use statements that re-export the target.
+   * Also follows pub mod declarations to find which module defines the type.
+   */
+  private async resolveReexport(
+    fromDir: string,
+    segments: string[],
+  ): Promise<string | null> {
+    const barrelFiles = ["lib.rs", "mod.rs"];
+
+    for (const barrel of barrelFiles) {
+      const barrelPath = path.join(fromDir, barrel);
+      if (!(await this.fileExists(barrelPath))) continue;
+
+      const content = await this.readFileSafe(barrelPath);
+      if (!content) continue;
+
+      // 1. Check pub use statements
+      const pubUseRegex = /pub\s+use\s+([a-z_][a-z0-9_:]*)(?:::\{[^}]*\})?\s*;/g;
+      let match: RegExpExecArray | null;
+
+      while ((match = pubUseRegex.exec(content)) !== null) {
+        const reexportPath = match[1];
+        const reexportSegments = reexportPath.split("::");
+
+        if (this.segmentsMatch(reexportSegments, segments)) {
+          const resolved = await this.resolveModDeclaration(fromDir, reexportPath);
+          if (resolved) return resolved;
+        }
+      }
+
+      // 2. Check pub mod declarations — find which module might define the type
+      // This handles: use shared::common::FilePath
+      // where FilePath is defined in taxonomy_path_vo.rs (re-exported via pub mod)
+      const lastSegment = segments[segments.length - 1] ?? "";
+      if (lastSegment && lastSegment[0] === lastSegment[0].toUpperCase()) {
+        // Last segment is a type name (uppercase) — look for pub mod declarations
+        const pubModRegex = /pub\s+mod\s+([a-z_][a-z0-9_]*)\s*;/g;
+        let modMatch: RegExpExecArray | null;
+
+        while ((modMatch = pubModRegex.exec(content)) !== null) {
+          const modName = modMatch[1];
+          // Check if this module file contains the type
+          const modFilePath = path.join(fromDir, modName + ".rs");
+          const modDirPath = path.join(fromDir, modName, "mod.rs");
+
+          let modContent: string | null = null;
+          if (await this.fileExists(modFilePath)) {
+            modContent = await this.readFileSafe(modFilePath);
+          } else if (await this.fileExists(modDirPath)) {
+            modContent = await this.readFileSafe(modDirPath);
+          }
+
+          if (modContent) {
+            // Check if the type is defined in this module
+            const typeRegex = new RegExp(
+              `(?:pub\s+(?:struct|enum|trait|type)\s+|pub\s+use\s+[^;]*\b)${lastSegment}\b`,
+            );
+            if (typeRegex.test(modContent)) {
+              // Found! Return this module file
+              if (await this.fileExists(modFilePath)) {
+                return normalizePath(modFilePath);
+              }
+              if (await this.fileExists(modDirPath)) {
+                return normalizePath(modDirPath);
+              }
+            }
+          }
+        }
+      }
+    }
+
+    return null;
+  }
+
+  /**
+   * Check if target segments match (exact or suffix match).
+   */
+  private segmentsMatch(reexportSegments: string[], targetSegments: string[]): boolean {
+    if (reexportSegments.length === targetSegments.length) {
+      return reexportSegments.every((s, i) => s === targetSegments[i]);
+    }
+    if (reexportSegments.length > targetSegments.length) {
+      const suffix = reexportSegments.slice(reexportSegments.length - targetSegments.length);
+      return suffix.every((s, i) => s === targetSegments[i]);
+    }
+    return false;
+  }
+
+  /**
+   * Read file content safely.
+   */
+  private async readFileSafe(filePath: string): Promise<string | null> {
+    try {
+      const fs = await import("node:fs/promises");
+      return await fs.readFile(filePath, "utf-8");
+    } catch {
+      return null;
+    }
   }
 
   /**
