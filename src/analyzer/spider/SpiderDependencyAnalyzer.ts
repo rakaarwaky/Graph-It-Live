@@ -55,6 +55,18 @@ export class SpiderDependencyAnalyzer {
           || /[\/]index\.(ts|tsx|js|jsx|mts|cts|mjs|cjs)$/.test(resolvedPath)
           || resolvedPath.endsWith("/__init__.py");
         if (isBarrel && typeof (analyzer as any).expandModuleImport === "function") {
+          // Also record the barrel file itself for reverse dependency lookup
+          // (files inside the barrel dir can query "who imports this module?")
+          const normalizedBarrel = normalizePath(resolvedPath);
+          if (!seenResolvedPaths.has(normalizedBarrel)) {
+            seenResolvedPaths.add(normalizedBarrel);
+            dependencies.push({
+              path: normalizedBarrel,
+              type: imp.type,
+              line: imp.line,
+              module: imp.module,
+            });
+          }
           const expanded = await (analyzer as any).expandModuleImport(filePath, imp.module);
           for (const expPath of expanded) {
             const normalizedExp = normalizePath(expPath);

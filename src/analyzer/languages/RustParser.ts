@@ -374,12 +374,53 @@ export class RustParser implements ILanguageAnalyzer {
    * Collect all identifiers from use declaration
    * IMPORTANT: Only collect module paths (snake_case), not type names (PascalCase)
    */
+  /**
+   * Expand use_list syntax: use path::{A, B, C} → ["path::A", "path::B", "path::C"]
+   * This ensures each type import gets its own resolvePath call.
+   */
+  private expandUseLists(
+    node: Node,
+    content: string,
+    identifiers: string[],
+    seen: Set<string>,
+  ): void {
+    const scopedUseLists = this.findAllByType(node, "scoped_use_list");
+    for (const scopedUseList of scopedUseLists) {
+      // Get the base path (e.g., "shared::code_analysis")
+      const basePathNode = this.findChildByType(scopedUseList, "scoped_identifier");
+      if (!basePathNode) continue;
+      const basePath = this.getNodeText(basePathNode, content);
+      if (!basePath) continue;
+
+      // Get the use_list node (e.g., "{A, B, C}")
+      const useListNode = this.findChildByType(scopedUseList, "use_list");
+      if (!useListNode) continue;
+
+      // Extract individual identifiers from use_list
+      for (const child of useListNode.children) {
+        if (child.type === "identifier") {
+          const name = this.getNodeText(child, content);
+          if (!name || name === "*") continue;
+          const fullPath = `${basePath}::${name}`;
+          if (!seen.has(fullPath)) {
+            seen.add(fullPath);
+            identifiers.push(fullPath);
+          }
+        }
+      }
+    }
+  }
+
   private collectIdentifiers(
     node: Node,
     content: string,
   ): string[] {
     const identifiers: string[] = [];
     const seen = new Set<string>();
+
+    // Expand use_list: use path::{A, B, C} → ["path::A", "path::B", "path::C"]
+    // This ensures each type gets its own resolvePath call
+    this.expandUseLists(node, content, identifiers, seen);
 
     // Find scoped_identifier (e.g., std::collections::HashMap or crate::interpreter::func)
     // Only collect OUTERMOST scoped_identifiers (skip nested prefixes)

@@ -146,7 +146,7 @@ export class IndexerWorkerHost {
     this.startTime = Date.now();
     this.updateState('counting');
 
-    const timeoutMs = config.timeoutMs ?? 10 * 60 * 1000; // 10 minutes default
+    const timeoutMs = config.timeoutMs ?? 30 * 60 * 1000; // 30 minutes default
 
     return new Promise((resolve, reject) => {
       const safeResolve = (result: IndexingResult): void => {
