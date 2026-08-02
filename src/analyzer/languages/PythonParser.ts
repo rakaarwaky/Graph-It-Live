@@ -387,4 +387,57 @@ export class PythonParser implements ILanguageAnalyzer {
   private getNodeText(node: Node, content: string): string {
     return content.slice(node.startIndex, node.endIndex);
   }
+
+  /**
+   * Expand a module import into all re-exported type files.
+   * For Python: __init__.py barrel → all from .xxx import targets.
+   */
+  async expandModuleImport(
+    fromFile: string,
+    moduleSpecifier: string,
+  ): Promise<string[]> {
+    const resolved = await this.resolvePath(fromFile, moduleSpecifier);
+    if (!resolved) return [];
+
+    // Check if resolved to __init__.py
+    const basename = require("path").basename(resolved);
+    if (basename !== "__init__.py") return [resolved];
+
+    // Read __init__.py and extract re-exports
+    let content: string;
+    try {
+      content = await this.fileReader.readFile(resolved);
+    } catch {
+      return [resolved];
+    }
+
+    const dir = require("path").dirname(resolved);
+    const results: string[] = [];
+
+    // Match: from .module import Name
+    // Match: from .module import Name1, Name2
+    // Match: from . import module
+    const reImportRe = /from\s+\.([^\s]+)\s+import\s+(.+)/g;
+    let match: RegExpExecArray | null;
+
+    while ((match = reImportRe.exec(content)) !== null) {
+      const submodule = match[1].trim();
+      const imports = match[2].split(",").map(s => s.trim().split("\s+as\s+")[0].trim());
+
+      // Check if importing specific names (uppercase = likely classes/types)
+      const hasTypes = imports.some(i => i[0] === i[0].toUpperCase() && i !== "*" && i[0] !== "_");
+      if (!hasTypes) continue;
+
+      // Resolve the submodule file
+      const subFile = require("path").join(dir, submodule + ".py");
+      try {
+        const stat = await require("fs/promises").stat(subFile);
+        if (stat.isFile() && !results.includes(subFile)) {
+          results.push(subFile);
+        }
+      } catch {}
+    }
+
+    return results.length > 0 ? results : [resolved];
+  }
 }

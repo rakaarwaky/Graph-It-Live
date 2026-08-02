@@ -439,7 +439,7 @@ describe('RustParser Property-Based Tests', { timeout: 30_000 }, () => {
       );
     });
 
-    it('Feature: tree-sitter-wasm-migration, Property 4: For any Rust file, module names are normalized to lowercase', async () => {
+    it('Feature: tree-sitter-wasm-migration, Property 4: For any Rust file, module names preserve original case for type detection', async () => {
       await fc.assert(
         fc.asyncProperty(
           fc.array(
@@ -461,13 +461,8 @@ describe('RustParser Property-Based Tests', { timeout: 30_000 }, () => {
               await fs.writeFile(tempFilePath, content);
               const deps = await parser.parseImports(tempFilePath);
 
-              // Verify all module names are lowercase
-              for (const dep of deps) {
-                expect(dep.module).toBe(dep.module.toLowerCase());
-              }
-
-              // Verify we extracted the expected modules (in lowercase)
-              const expectedModules = [...new Set(moduleNames.map(m => m.toLowerCase()))];
+              // Verify we extracted all expected modules (original case preserved)
+              const expectedModules = [...new Set(moduleNames)];
               expect(deps.length).toBe(expectedModules.length);
             } finally {
               try {

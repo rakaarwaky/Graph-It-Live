@@ -170,7 +170,16 @@ export class RustParser implements ILanguageAnalyzer {
       // 2. Try local module resolution FIRST (from current crate's directory)
       // This handles: mod filesystem; in shared/src/lib.rs → shared/src/filesystem/
       const localResult = await this.resolveModDeclaration(fromDir, moduleSpecifier);
-      if (localResult) return localResult;
+      if (localResult) {
+        // Type lookup: if result is barrel and last segment is a type, find the actual file
+        const lastSegOrig = moduleSpecifier.split("::").pop()?.split("/").pop() ?? "";
+        const isType = lastSegOrig.length > 0 && lastSegOrig[0] === lastSegOrig[0].toUpperCase();
+        if (isType && (localResult.endsWith("/mod.rs") || localResult.endsWith("/lib.rs"))) {
+          const lookup = await this.findTypeDefinitionFile(path.dirname(localResult), [lastSegOrig]);
+          if (lookup) return lookup;
+        }
+        return localResult;
+      }
 
       // 3. Check hardcoded external crates (quick skip)
       const firstComponent = moduleSpecifier.split("::")[0];
@@ -197,7 +206,29 @@ export class RustParser implements ILanguageAnalyzer {
           
           // Try resolving the remaining path
           const resolved = await this.resolveModDeclaration(crateSrcPath, remainingPath);
-          if (resolved) return resolved;
+          if (resolved) {
+            // Type lookup: if result is mod.rs/lib.rs and last segment is a type, find the actual file
+            const lastSegOrig = moduleSpecifier.split("::").pop() ?? "";
+            const isType = lastSegOrig.length > 0 && lastSegOrig[0] === lastSegOrig[0].toUpperCase();
+            if (isType && (resolved.endsWith("/mod.rs") || resolved.endsWith("/lib.rs"))) {
+              const barrelDir = path.dirname(resolved);
+              try {
+                const barrelContent = await fs.readFile(resolved, "utf-8");
+                const pubModRe = /pub\s+mod\s+([a-z_][a-z0-9_]*)\s*;/g;
+                let mm;
+                while ((mm = pubModRe.exec(barrelContent)) !== null) {
+                  for (const mf of [path.join(barrelDir, mm[1] + ".rs"), path.join(barrelDir, mm[1], "mod.rs")]) {
+                    try {
+                      const mc = await fs.readFile(mf, "utf-8");
+                      const tr = new RegExp("(?:pub\\s+(?:struct|enum|trait|type)\\s+|pub\\s+use\\s+[^;]*\\b)" + lastSegOrig + "\\b");
+                      if (tr.test(mc)) return normalizePath(mf);
+                    } catch {}
+                  }
+                }
+              } catch {}
+            }
+            return resolved;
+          }
           
           // Fallback: if remaining path is a type (uppercase), return crate's lib.rs
           const lastSegment = remainingPath.split("/").pop() ?? "";
@@ -249,7 +280,8 @@ export class RustParser implements ILanguageAnalyzer {
       }
       
       // Include everything else — workspace resolver handles resolution, not filtering
-      // For local modules, normalize to lowercase (Rust convention: file names are lowercase)
+      // Keep original case for type detection (uppercase = type name)
+      // resolveModDeclaration handles lowercase conversion internally
       const normalizedModule = module.toLowerCase();
       
       if (!seen.has(normalizedModule)) {
@@ -258,7 +290,7 @@ export class RustParser implements ILanguageAnalyzer {
           path: "",
           type: "import",
           line: node.startPosition.row + 1,
-          module: normalizedModule, // Use lowercase for local modules
+          module: module, // Keep original case for type detection
         });
       }
     }
@@ -284,8 +316,7 @@ export class RustParser implements ILanguageAnalyzer {
     const nameNode = this.findChildByType(node, "identifier");
     if (nameNode) {
       let module = this.getNodeText(nameNode, content);
-      // Normalize: Rust module file names are always lowercase
-      module = module.toLowerCase();
+      // Keep original case for type detection — resolveModDeclaration handles lowercase internally
       
       if (module && !seen.has(module)) {
         seen.add(module);
@@ -327,14 +358,13 @@ export class RustParser implements ILanguageAnalyzer {
       }
 
       // Include everything else — workspace resolver handles resolution, not filtering
-      const normalizedModule = module.toLowerCase();
-      if (!seen.has(normalizedModule)) {
-        seen.add(normalizedModule);
+      if (!seen.has(module)) {
+        seen.add(module);
         dependencies.push({
           path: "",
           type: "import",
           line: node.startPosition.row + 1,
-          module: normalizedModule,
+          module: module,
         });
       }
     }
@@ -424,9 +454,23 @@ export class RustParser implements ILanguageAnalyzer {
   ): Promise<string | null> {
     const fromDir = path.dirname(fromFile);
 
-    // Handle crate::module -> go to project root
+    // Handle crate::module -> resolve from crate root (find lib.rs/src/)
     if (moduleSpecifier.startsWith("crate::")) {
       const relativePath = moduleSpecifier.slice(7).replaceAll("::", "/");
+      // Find crate root by walking up from current file to find lib.rs or src/
+      let crateRoot = path.dirname(fromFile);
+      while (crateRoot !== path.dirname(crateRoot)) {
+        if (await this.fileExists(path.join(crateRoot, "lib.rs")) ||
+            await this.fileExists(path.join(crateRoot, "src", "lib.rs"))) {
+          // Found crate root
+          const srcDir = await this.fileExists(path.join(crateRoot, "src", "lib.rs"))
+            ? path.join(crateRoot, "src")
+            : crateRoot;
+          return await this.resolveModDeclaration(srcDir, relativePath);
+        }
+        crateRoot = path.dirname(crateRoot);
+      }
+      // Fallback to workspace root
       return await this.resolveModDeclaration(this.rootDir, relativePath);
     }
 
@@ -504,11 +548,28 @@ export class RustParser implements ILanguageAnalyzer {
       const isTypeImport = lastSegOriginal.length > 0 && lastSegOriginal[0] === lastSegOriginal[0].toUpperCase();
       
       if (isTypeImport && (progressiveResult.endsWith("/mod.rs") || progressiveResult.endsWith("/lib.rs"))) {
-        // Try re-export resolution to find the actual file
-        const reexportResult = await this.resolveReexport(path.dirname(progressiveResult), [lastSegOriginal.toLowerCase()]);
-        if (reexportResult) return reexportResult;
+        // Inline: scan pub mod declarations to find which module defines the type
+        const barrelDir = path.dirname(progressiveResult);
+        let barrelContent: string | null = null;
+        try { barrelContent = await fs.readFile(progressiveResult, "utf-8"); } catch {}
+                if (barrelContent) {
+          const pubModRe = /pub\s+mod\s+([a-z_][a-z0-9_]*)\s*;/g;
+          let mm: RegExpExecArray | null;
+          while ((mm = pubModRe.exec(barrelContent)) !== null) {
+            const mName = mm[1];
+            for (const mFile of [path.join(barrelDir, mName + ".rs"), path.join(barrelDir, mName, "mod.rs")]) {
+              try {
+                const mContent = await fs.readFile(mFile, "utf-8");
+                const typeRe = new RegExp("(?:pub\\s+(?:struct|enum|trait|type)\\s+|pub\\s+use\\s+[^;]*\\b)" + lastSegOriginal + "\\b");
+                const matched = typeRe.test(mContent);
+                if (mName === "taxonomy_path_vo") console.log("SCAN_DB: mFile=" + mFile + " contentLen=" + mContent.length + " matched=" + matched + " hasPubStruct=" + mContent.includes("pub struct FilePath") + " regexSource=" + typeRe.source);
+                if (matched) return normalizePath(mFile);
+              } catch(e) {}
+            }
+          }
+        }
       }
-      return progressiveResult;
+            return progressiveResult;
     }
 
     // Strategy 0b: If last segment is not a file, try parent path
@@ -527,7 +588,7 @@ export class RustParser implements ILanguageAnalyzer {
     if (recursiveResult) return recursiveResult;
 
     // Strategy 3: Re-export resolution (pub use)
-    const reexportResult = await this.resolveReexport(fromDir, segments);
+    const reexportResult = await this.findTypeDefinitionFile(fromDir, segments);
     if (reexportResult) return reexportResult;
 
     // Strategy 4: Workspace crate resolution
@@ -634,12 +695,20 @@ export class RustParser implements ILanguageAnalyzer {
         continue;
       }
 
-      // Try module.rs as a file that declares sub-modules
-      // (e.g., common.rs that has `mod taxonomy_path_vo;` inside)
-      if (await this.fileExists(fileCandidate)) {
-        // The file exists but we need to find a sub-module inside it
-        // This is unusual — normally sub-modules are in mod.rs
-        // Skip for now
+      // Try hyphen variant: cli_commands -> cli-commands
+      const hyphenSegment = segment.replace(/_/g, "-");
+      if (hyphenSegment !== segment) {
+        const hyphenModDir = path.join(currentDir, hyphenSegment);
+        const hyphenModRs = path.join(hyphenModDir, "mod.rs");
+        if (await this.fileExists(hyphenModRs)) {
+          if (isLast) return normalizePath(hyphenModRs);
+          currentDir = hyphenModDir;
+          continue;
+        }
+        const hyphenFile = path.join(currentDir, hyphenSegment + ".rs");
+        if (await this.fileExists(hyphenFile)) {
+          if (isLast) return normalizePath(hyphenFile);
+        }
       }
 
       // Can't resolve this segment
@@ -654,7 +723,58 @@ export class RustParser implements ILanguageAnalyzer {
    * Check barrel files (lib.rs, mod.rs) for pub use statements that re-export the target.
    * Also follows pub mod declarations to find which module defines the type.
    */
-  private async resolveReexport(
+  /**
+   * Expand a module import (e.g., "shared::common") into all re-exported type files.
+   * Returns an array of absolute paths to the actual type definition files,
+   * skipping mod.rs/lib.rs barrel files.
+   */
+  async expandModuleImport(
+    fromFile: string,
+    moduleSpecifier: string,
+  ): Promise<string[]> {
+    const resolved = await this.resolvePath(fromFile, moduleSpecifier);
+    if (!resolved) return [];
+
+    // If not a barrel file, return as-is
+    if (!resolved.endsWith("/mod.rs") && !resolved.endsWith("/lib.rs")) {
+      return [resolved];
+    }
+
+    // Read barrel file and extract all pub use re-exports
+    const barrelDir = path.dirname(resolved);
+    let barrelContent: string;
+    try {
+      barrelContent = await fs.readFile(resolved, "utf-8");
+    } catch {
+      return [resolved];
+    }
+
+    const results: string[] = [];
+    const pubUseRe = /pub\s+use\s+([a-zA-Z_][a-zA-Z0-9_:]*)(?:\s+as\s+([a-zA-Z_][a-zA-Z0-9_]*))?\s*;/g;
+    let match: RegExpExecArray | null;
+
+    while ((match = pubUseRe.exec(barrelContent)) !== null) {
+      const reexportPath = match[1];
+      const alias = match[2];
+      const typeName = alias || reexportPath.split("::").pop();
+
+      // Skip non-type re-exports (lowercase = module re-export)
+      if (!typeName || typeName[0] !== typeName[0].toUpperCase()) continue;
+
+      try {
+        const reexportResolved = await this.resolvePath(resolved, reexportPath);
+        if (reexportResolved && !reexportResolved.endsWith("/mod.rs") && !reexportResolved.endsWith("/lib.rs")) {
+          if (!results.includes(reexportResolved)) {
+            results.push(reexportResolved);
+          }
+        }
+      } catch {}
+    }
+
+    return results.length > 0 ? results : [resolved];
+  }
+
+  private async findTypeDefinitionFile(
     fromDir: string,
     segments: string[],
   ): Promise<string | null> {
@@ -667,17 +787,23 @@ export class RustParser implements ILanguageAnalyzer {
       const content = await this.readFileSafe(barrelPath);
       if (!content) continue;
 
-      // 1. Check pub use statements
-      const pubUseRegex = /pub\s+use\s+([a-z_][a-z0-9_:]*)(?:::\{[^}]*\})?\s*;/g;
+      // 1. Check pub use statements — follow re-export chains
+      const pubUseRegex = /pub\s+use\s+([a-zA-Z_][a-zA-Z0-9_:]*)(?:\s+as\s+([a-zA-Z_][a-zA-Z0-9_]*))?\s*;/g;
       let match: RegExpExecArray | null;
+      const lastSeg = segments[segments.length - 1] ?? "";
 
       while ((match = pubUseRegex.exec(content)) !== null) {
         const reexportPath = match[1];
-        const reexportSegments = reexportPath.split("::");
-
-        if (this.segmentsMatch(reexportSegments, segments)) {
+        const pubUseAlias = match[2];
+        const pubUseLast = reexportPath.split("::").pop() ?? "";
+        if (pubUseLast === lastSeg || pubUseAlias === lastSeg) {
+          // Resolve the re-export path to find actual definition file
           const resolved = await this.resolveModDeclaration(fromDir, reexportPath);
-          if (resolved) return resolved;
+          if (resolved && (resolved.endsWith("/mod.rs") || resolved.endsWith("/lib.rs"))) {
+            const deeper = await this.findTypeDefinitionFile(path.dirname(resolved), [lastSeg]);
+            if (deeper) return deeper;
+          }
+          return resolved ?? normalizePath(barrelPath);
         }
       }
 
@@ -705,9 +831,7 @@ export class RustParser implements ILanguageAnalyzer {
 
           if (modContent) {
             // Check if the type is defined in this module
-            const typeRegex = new RegExp(
-              `(?:pub\s+(?:struct|enum|trait|type)\s+|pub\s+use\s+[^;]*\b)${lastSegment}\b`,
-            );
+            const typeRegex = new RegExp("(?:pub\\s+(?:struct|enum|trait|type)\\s+|pub\\s+use\\s+[^;]*\\b)" + lastSegment + "\\b");
             if (typeRegex.test(modContent)) {
               // Found! Return this module file
               if (await this.fileExists(modFilePath)) {

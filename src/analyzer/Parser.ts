@@ -246,4 +246,58 @@ export class Parser implements ILanguageAnalyzer {
     const actualFromFile = extractFilePath(fromFile);
     return this.pathResolver.resolve(actualFromFile, moduleSpecifier);
   }
+
+  /**
+   * Expand a module import into all re-exported type files.
+   * For TypeScript: index.ts barrel → all export ... from targets.
+   */
+  async expandModuleImport(
+    fromFile: string,
+    moduleSpecifier: string,
+  ): Promise<string[]> {
+    const resolved = await this.resolvePath(fromFile, moduleSpecifier);
+    if (!resolved) return [];
+
+    // Check if resolved to a barrel file (index.ts/tsx/js/jsx)
+    const basename = require("path").basename(resolved);
+    const isBarrel = /^index\.(ts|tsx|js|jsx|mts|cts|mjs|cjs)$/.test(basename);
+    if (!isBarrel) return [resolved];
+
+    // Read barrel and extract re-exports
+    let content: string;
+    try {
+      content = await this.fileReader.readFile(resolved);
+    } catch {
+      return [resolved];
+    }
+
+    const dir = require("path").dirname(resolved);
+    const results: string[] = [];
+
+    // Match: export { X } from './module';
+    // Match: export * from './module';
+    // Match: export { default as X } from './module';
+    const reExportRe = /export\s+(?:\{[^}]*\}|\*)\s+from\s+['"]([^'"]+)['"]/g;
+    let match: RegExpExecArray | null;
+
+    while ((match = reExportRe.exec(content)) !== null) {
+      const fromPath = match[1];
+      if (fromPath.startsWith(".")) {
+        const target = require("path").resolve(dir, fromPath);
+        // Try resolving with extensions
+        for (const ext of ["", ".ts", ".tsx", ".js", ".jsx", "/index.ts", "/index.tsx", "/index.js"]) {
+          const candidate = target + ext;
+          try {
+            const stat = await require("fs/promises").stat(candidate);
+            if (stat.isFile() && !results.includes(candidate)) {
+              results.push(candidate);
+              break;
+            }
+          } catch {}
+        }
+      }
+    }
+
+    return results.length > 0 ? results : [resolved];
+  }
 }

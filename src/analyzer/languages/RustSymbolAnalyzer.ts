@@ -622,10 +622,11 @@ export class RustSymbolAnalyzer implements ISymbolAnalyzer {
         if (moduleSpecifier === undefined) return;
       // Create dependency with module specifier as targetFilePath
       // This will be resolved to absolute path by SpiderSymbolService.getSymbolGraph()
+      const fullPath = moduleSpecifier ? `${moduleSpecifier}::${symbolName}` : symbolName;
       dependencies.push({
         sourceSymbolId: scope,
         targetSymbolId: `${moduleSpecifier}:${symbolName}`, // Module specifier + symbol name
-        targetFilePath: moduleSpecifier, // Will be resolved by PathResolver
+        targetFilePath: fullPath, // Full path for type detection in resolvePath
         isTypeOnly: false,
       });
       return;
@@ -635,10 +636,11 @@ export class RustSymbolAnalyzer implements ISymbolAnalyzer {
     if (importMap?.has(symbolName)) {
       const moduleSpecifier = importMap.get(symbolName);
       if (moduleSpecifier === undefined) return;
+      const fullPath2 = moduleSpecifier ? `${moduleSpecifier}::${symbolName}` : symbolName;
       dependencies.push({
         sourceSymbolId: scope,
         targetSymbolId: `${moduleSpecifier}:${symbolName}`,
-        targetFilePath: moduleSpecifier,
+        targetFilePath: fullPath2,
         isTypeOnly: false,
       });
     }

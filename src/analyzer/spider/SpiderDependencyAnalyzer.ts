@@ -49,16 +49,35 @@ export class SpiderDependencyAnalyzer {
           continue;
         }
 
-        const normalizedResolved = normalizePath(resolvedPath);
-        if (seenResolvedPaths.has(normalizedResolved)) continue;
-        seenResolvedPaths.add(normalizedResolved);
-
-        dependencies.push({
-          path: normalizedResolved,
-          type: imp.type,
-          line: imp.line,
-          module: imp.module,
-        });
+        // If resolved to a barrel file (mod.rs/lib.rs), expand to actual type files
+        // This ensures mod.rs never appears as a target in the dependency graph
+        const isBarrel = resolvedPath.endsWith("/mod.rs") || resolvedPath.endsWith("/lib.rs")
+          || /[\/]index\.(ts|tsx|js|jsx|mts|cts|mjs|cjs)$/.test(resolvedPath)
+          || resolvedPath.endsWith("/__init__.py");
+        if (isBarrel && typeof (analyzer as any).expandModuleImport === "function") {
+          const expanded = await (analyzer as any).expandModuleImport(filePath, imp.module);
+          for (const expPath of expanded) {
+            const normalizedExp = normalizePath(expPath);
+            if (seenResolvedPaths.has(normalizedExp)) continue;
+            seenResolvedPaths.add(normalizedExp);
+            dependencies.push({
+              path: normalizedExp,
+              type: imp.type,
+              line: imp.line,
+              module: imp.module,
+            });
+          }
+        } else {
+          const normalizedResolved = normalizePath(resolvedPath);
+          if (seenResolvedPaths.has(normalizedResolved)) continue;
+          seenResolvedPaths.add(normalizedResolved);
+          dependencies.push({
+            path: normalizedResolved,
+            type: imp.type,
+            line: imp.line,
+            module: imp.module,
+          });
+        }
       }
 
       log.debug(`Resolved ${dependencies.length} dependencies for ${filePath}`);
